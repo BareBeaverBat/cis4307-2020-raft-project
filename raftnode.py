@@ -9,13 +9,12 @@ import rpyc
 import sys
 
 
-
-
 class NodeRef:
     def __init__(self, name, hostAddr, port):
         self.name = name
         self.host = hostAddr
         self.port = port
+
 
 class RpcReturn:
     def __init__(self, termNum, outcomeBoolean):
@@ -34,13 +33,13 @@ protocol.
 
 
 class RaftNode(rpyc.Service):
-    ELECTION_TIMEOUT_BASELINE=0.150 #seconds to wait before calling an election
-    HEARTBEAT_INTERVAL= ELECTION_TIMEOUT_BASELINE/5
+    ELECTION_TIMEOUT_BASELINE = 0.150  # seconds to wait before calling an election
+    HEARTBEAT_INTERVAL = ELECTION_TIMEOUT_BASELINE / 5
     NODE_STATE_FOLDER = "node_states"
 
-    BACKUP_SEPARATOR=":"
-    TERM_BACKUP_KEY="term"
-    VOTE_BACKUP_KEY="vote"
+    BACKUP_SEPARATOR = ":"
+    TERM_BACKUP_KEY = "term"
+    VOTE_BACKUP_KEY = "vote"
 
     def _construct_node_state_file_path(self):
         pathStr = os.path.join(RaftNode.NODE_STATE_FOLDER, "node" + self.identityIndex + ".txt")
@@ -90,7 +89,7 @@ class RaftNode(rpyc.Service):
         self.currTerm = 0
         self.voteTarget = None  # who the node is voting for in the current term
 
-        #set up logging
+        # set up logging
         nodeName = "raftNode_" + str(nodeIdentityIndex)
         self.nodeLogger = logging.getLogger(nodeName)
         self.nodeLogger.setLevel(logging.DEBUG)
@@ -104,7 +103,6 @@ class RaftNode(rpyc.Service):
         consoleHandler.setFormatter(formatter)
         self.nodeLogger.addHandler(logFileHandler)
         self.nodeLogger.addHandler(consoleHandler)
-
 
         nodeStateBackupFilePath = self._construct_node_state_file_path()
         if os.path.exists(nodeStateBackupFilePath):
@@ -121,7 +119,7 @@ class RaftNode(rpyc.Service):
                     storedVoteVal = int(storedVoteStr)
                     self.voteTarget = storedVoteVal
 
-                #todo? do I need to restore leader status?
+                # todo? do I need to restore leader status?
 
         self.otherNodes = []
         with open(configFilePath) as nodesConfigFile:
@@ -137,14 +135,11 @@ class RaftNode(rpyc.Service):
                     otherNode = NodeRef(otherNodeName, otherNodeHost, otherNodePort)
                     self.otherNodes.append(otherNode)
 
-
-        self.electionTimeout = (1+random.random())*RaftNode.ELECTION_TIMEOUT_BASELINE
+        self.electionTimeout = (1 + random.random()) * RaftNode.ELECTION_TIMEOUT_BASELINE
         self._restart_timeout()
 
         self.nodeLogger.debug("I am node %d and I just finished being constructed, with %d fellow nodes",
-              self.identityIndex, len(self.otherNodes))
-
-
+                              self.identityIndex, len(self.otherNodes))
 
     '''
         x = is_leader(): returns True or False, depending on whether
@@ -162,10 +157,13 @@ class RaftNode(rpyc.Service):
     def exposed_append_entries(self, leaderTerm, leaderIndex):
         willAppendEntries = False
         if leaderTerm < self.currTerm:
-            self.nodeLogger.info("in term %d, received append_entries() from stale leader %d which thought it was in term %d", self.currTerm, leaderIndex, leaderTerm)
+            self.nodeLogger.info(
+                "while in term %d, received append_entries() from stale leader %d which thought it was in term %d",
+                self.currTerm, leaderIndex, leaderTerm)
         else:
-            self.nodeLogger.debug("in term %d, executing append_entries on behalf of node %d, the leader in term %d",
-                                  self.currTerm, leaderIndex, leaderTerm)
+            self.nodeLogger.debug(
+                "while in term %d, executing append_entries on behalf of node %d, the leader in term %d",
+                self.currTerm, leaderIndex, leaderTerm)
 
             self._restart_timeout()
 
@@ -182,7 +180,6 @@ class RaftNode(rpyc.Service):
 
             willAppendEntries = True
 
-
         return RpcReturn(self.currTerm, willAppendEntries)
 
     def call_append_entries(self, otherNodeDesc):
@@ -197,17 +194,15 @@ class RaftNode(rpyc.Service):
                                   self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
         return appendEntriesRetVal
 
-
-
-
     def exposed_request_vote(self, candidateTerm, candidateIndex):
         willVote = False
 
         if candidateTerm < self.currTerm:
-            self.nodeLogger.info(
-                "in term %d, received request_vote() from stale leader %d which thought it was in term %d",
-                self.currTerm, candidateIndex, candidateTerm)
+            self.nodeLogger.info("while in term %d, received request_vote() from stale leader %d "
+                "which thought it was in term %d", self.currTerm, candidateIndex, candidateTerm)
         else:
+            self.nodeLogger.debug("while in term %d, executing request on behalf of node %d, a candidate in term %d",
+                                  self.currTerm, candidateIndex, candidateTerm)
             if candidateTerm > self.currTerm:
                 if self.voteTarget is not None:
                     self.nodeLogger.warning("was in election for term %d, voting for candidate node %d, "
@@ -221,16 +216,15 @@ class RaftNode(rpyc.Service):
             else:
                 if self.exposed_is_leader():
                     self.nodeLogger.warning("elected leader %d received request_vote() from candidate %d "
-                                          "when both are in term %d", self.identityIndex, candidateIndex, candidateTerm)
+                                            "when both are in term %d", self.identityIndex, candidateIndex,
+                                            candidateTerm)
 
-            if  self.voteTarget is None:
+            if self.voteTarget is None:
                 self._restart_timeout()
 
                 self.voteTarget = candidateIndex
                 self._save_node_state()
                 willVote = True
-
-
 
         return RpcReturn(self.currTerm, willVote)
 
@@ -245,8 +239,6 @@ class RaftNode(rpyc.Service):
             self.nodeLogger.error("Exception for candidate node %d in term %d: %s\n%s\n%s",
                                   self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
         return requestVoteRetVal
-
-
 
     def check_for_election_timeout(self):
         if self.exposed_is_leader():
@@ -265,7 +257,6 @@ class RaftNode(rpyc.Service):
 
                 nodesToContact = self.otherNodes.copy()
 
-
                 while len(nodesToContact) > 0 and self.isCandidate:
                     currOtherNode = nodesToContact.pop(0)
                     nodeVoteResponse = self.call_request_vote(currOtherNode)
@@ -279,14 +270,12 @@ class RaftNode(rpyc.Service):
                         self.currTerm = nodeVoteResponse.term
                         self._restart_timeout()
 
-                    #possible race condition with _leaderStatus?
-                    if numVotes > numNodes/2:
+                    # possible race condition with _leaderStatus?
+                    if numVotes > numNodes / 2:
                         self._leaderStatus = True
                         self.isCandidate = False
 
                         self.send_heartbeats()
-
-
 
     def send_heartbeats(self):
         assert self.exposed_is_leader()
