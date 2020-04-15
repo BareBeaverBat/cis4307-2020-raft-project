@@ -42,12 +42,12 @@ class RaftNode(rpyc.Service):
     TERM_BACKUP_KEY="term"
     VOTE_BACKUP_KEY="vote"
 
-    def _constructNodeStateFilePath(self):
+    def _construct_node_state_file_path(self):
         pathStr = os.path.join(RaftNode.NODE_STATE_FOLDER, "node" + self.identityIndex + ".txt")
         return pathStr
 
-    def _saveNodeState(self):
-        nodeStateStorageFilePath = self._constructNodeStateFilePath()
+    def _save_node_state(self):
+        nodeStateStorageFilePath = self._construct_node_state_file_path()
         with open(nodeStateStorageFilePath, mode="w") as nodeStateStorageFile:
             nodeState = RaftNode.TERM_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.currTerm) + "\n"
             if self.voteTarget is not None:
@@ -56,7 +56,7 @@ class RaftNode(rpyc.Service):
             nodeStateStorageFile.flush()
             os.fsync(nodeStateStorageFile.fileno())
 
-    def _loadNodeBackup(self, backupFile):
+    def _load_node_backup(self, backupFile):
         backupDict = {}
 
         for backupLine in backupFile:
@@ -71,6 +71,11 @@ class RaftNode(rpyc.Service):
                     self.nodeLogger.error("malformed line in node backup file: %s", backupLine)
 
         return backupDict
+
+    def _restart_timeout(self):
+        self.lastContactTimestamp = time.time()
+        electionTimer = threading.Timer(self.electionTimeout, self.check_for_election_timeout)
+        electionTimer.start()
 
     """
         Initialize the class using the config file provided and also initialize
@@ -101,10 +106,10 @@ class RaftNode(rpyc.Service):
         self.nodeLogger.addHandler(consoleHandler)
 
 
-        nodeStateBackupFilePath = self._constructNodeStateFilePath()
+        nodeStateBackupFilePath = self._construct_node_state_file_path()
         if os.path.exists(nodeStateBackupFilePath):
             with open(nodeStateBackupFilePath, mode="r") as nodeBackup:
-                nodeStateBackup = self._loadNodeBackup(nodeBackup)
+                nodeStateBackup = self._load_node_backup(nodeBackup)
 
                 storedTermStr = nodeStateBackup.get(RaftNode.TERM_BACKUP_KEY)
                 if storedTermStr is not None:
@@ -116,9 +121,7 @@ class RaftNode(rpyc.Service):
                     storedVoteVal = int(storedVoteStr)
                     self.voteTarget = storedVoteVal
 
-
-
-        #todo? do I need to restore leader status?
+                #todo? do I need to restore leader status?
 
         self.otherNodes = []
         with open(configFilePath) as nodesConfigFile:
@@ -136,11 +139,7 @@ class RaftNode(rpyc.Service):
 
 
         self.electionTimeout = (1+random.random())*RaftNode.ELECTION_TIMEOUT_BASELINE
-        self.lastContactTimestamp = time.time()
-        self._lastContactTimestampLock = threading.Lock()
-
-        electionTimer = threading.Timer(self.electionTimeout, self.check_for_election_timeout)
-        electionTimer.start()
+        self._restart_timeout()
 
         self.nodeLogger.debug("I am node %d and I just finished being constructed, with %d fellow nodes",
               self.identityIndex, len(self.otherNodes))
@@ -162,16 +161,13 @@ class RaftNode(rpyc.Service):
 
     def exposed_append_entries(self, leaderTerm, leaderIndex):
         willAppendEntries = False
-        if(leaderTerm < self.currTerm):
+        if leaderTerm < self.currTerm:
             self.nodeLogger.info("in term %d, received append_entries() from stale leader %d which thought it was in term %d", self.currTerm, leaderIndex, leaderTerm)
         else:
-            with self._lastContactTimestampLock:
-                self.lastContactTimestamp = time.time()
-                electionTimer = threading.Timer(self.electionTimeout, self.check_for_election_timeout)
-                electionTimer.start()
-
             self.nodeLogger.debug("in term %d, executing append_entries on behalf of node %d, the leader in term %d",
                                   self.currTerm, leaderIndex, leaderTerm)
+
+            self._restart_timeout()
 
             if leaderTerm > self.currTerm:
                 if self.voteTarget is not None:
@@ -212,35 +208,26 @@ class RaftNode(rpyc.Service):
                 "in term %d, received request_vote() from stale leader %d which thought it was in term %d",
                 self.currTerm, candidateIndex, candidateTerm)
         else:
-            with self._lastContactTimestampLock:
-                self.lastContactTimestamp = time.time()
-
             if candidateTerm > self.currTerm:
                 if self.voteTarget is not None:
                     self.nodeLogger.warning("was in election for term %d, voting for candidate node %d, "
                                             "when received request for vote in later term %d", self.currTerm,
                                             self.voteTarget, candidateTerm)
                     self.voteTarget = None
-                # cast vote here?
 
                 self.isCandidate = False
                 self._leaderStatus = False
                 self.currTerm = candidateTerm
-
-
             else:
-                assert not self.exposed_is_leader()
+                if self.exposed_is_leader():
+                    self.nodeLogger.warning("elected leader %d received request_vote() from candidate %d "
+                                          "when both are in term %d", self.identityIndex, candidateIndex, candidateTerm)
 
             if  self.voteTarget is None:
+                self._restart_timeout()
+
                 self.voteTarget = candidateIndex
-
-                self._saveNodeState()
-
-
-
-
-
-                # todo store vote choice on disk
+                self._save_node_state()
                 willVote = True
 
 
@@ -262,46 +249,62 @@ class RaftNode(rpyc.Service):
 
 
     def check_for_election_timeout(self):
-        self.nodeLogger.debug("checking whether election should be started")
-        #todo check if already leader (edge case)
-        with self._lastContactTimestampLock:
+        if self.exposed_is_leader():
+            self.nodeLogger.info("this node is ignoring an election timeout because it's the leader")
+        else:
+            self.nodeLogger.debug("checking whether election should be started")
             if (time.time() - self.lastContactTimestamp) > self.electionTimeout:
                 self.isCandidate = True
                 self.currTerm += 1
-                self.lastContactTimestamp = time.time()
+                self._restart_timeout()
 
-        if self.isCandidate:
-            self.nodeLogger.debug("starting election!")
-            # todo start election
-            numVotes = 1
-            numNodes = 1 + len(self.otherNodes)
+            if self.isCandidate:
+                self.nodeLogger.debug("starting election!")
+                numVotes = 1
+                numNodes = 1 + len(self.otherNodes)
 
-            for otherNode in self.otherNodes:
-                #todo ask node for vote, handling call failure
-                nodeVoteResponse = self.call_request_vote(otherNode)
+                nodesToContact = self.otherNodes.copy()
 
 
-                if not self.isCandidate:
-                    break
+                while len(nodesToContact) > 0 and self.isCandidate:
+                    currOtherNode = nodesToContact.pop(0)
+                    nodeVoteResponse = self.call_request_vote(currOtherNode)
 
-                #possible race condition with _leaderStatus?
-                if numVotes > numNodes/2:
-                    self._leaderStatus = True
-                    self.isCandidate = False
+                    if nodeVoteResponse is None:
+                        nodesToContact.append(currOtherNode)
+                    elif nodeVoteResponse.boolResult:
+                        numVotes += 1
+                    elif nodeVoteResponse.term > self.currTerm:
+                        self.isCandidate = False
+                        self.currTerm = nodeVoteResponse.term
+                        self._restart_timeout()
 
-                    heartbeatTimer = threading.Timer(RaftNode.HEARTBEAT_INTERVAL, self.send_heartbeats)
-                    heartbeatTimer.start()
+                    #possible race condition with _leaderStatus?
+                    if numVotes > numNodes/2:
+                        self._leaderStatus = True
+                        self.isCandidate = False
 
-                    break
+                        self.send_heartbeats()
 
 
 
     def send_heartbeats(self):
         assert self.exposed_is_leader()
 
+        heartbeatTimer = threading.Timer(RaftNode.HEARTBEAT_INTERVAL, self.send_heartbeats)
+        heartbeatTimer.start()
 
-        pass
-        #todo also reset leader's election timer?
+        nodesToContact = self.otherNodes.copy()
+        while len(nodesToContact) > 0 and self.exposed_is_leader():
+            currOtherNode = nodesToContact.pop(0)
+            nodeHeartbeatResponse = self.call_append_entries(currOtherNode)
+
+            if nodeHeartbeatResponse is None:
+                nodesToContact.append(currOtherNode)
+            elif nodeHeartbeatResponse.term > self.currTerm:
+                self._leaderStatus = False
+                self.currTerm = nodeHeartbeatResponse.term
+                self._restart_timeout()
 
 
 if __name__ == '__main__':
