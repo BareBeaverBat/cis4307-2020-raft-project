@@ -37,6 +37,10 @@ class RaftNode(rpyc.Service):
     HEARTBEAT_INTERVAL= ELECTION_TIMEOUT_BASELINE/5
     NODE_STATE_FOLDER = "node_states"
 
+    BACKUP_SEPARATOR=":"
+    TERM_BACKUP_KEY="term"
+    VOTE_BACKUP_KEY="vote"
+
     def _constructNodeStateFilePath(self):
         pathStr = os.path.join(RaftNode.NODE_STATE_FOLDER, "node" + self.identityIndex + ".txt")
         return pathStr
@@ -44,14 +48,28 @@ class RaftNode(rpyc.Service):
     def _saveNodeState(self):
         nodeStateStorageFilePath = self._constructNodeStateFilePath()
         with open(nodeStateStorageFilePath, mode="w") as nodeStateStorageFile:
-            nodeState = "term= %d\n" % self.currTerm
+            nodeState = RaftNode.TERM_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.currTerm) + "\n"
             if self.voteTarget is not None:
-                nodeState += "vote=%d\n" % self.voteTarget
+                nodeState += RaftNode.VOTE_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.voteTarget) + "\n"
             nodeStateStorageFile.write(nodeState)
             nodeStateStorageFile.flush()
             os.fsync(nodeStateStorageFile.fileno())
 
+    def _loadNodeBackup(self, backupFile):
+        backupDict = {}
 
+        for backupLine in backupFile:
+            if backupLine != "":
+                lineTokens = backupLine.split(RaftNode.BACKUP_SEPARATOR)
+                if len(lineTokens) == 2:
+                    currKey = lineTokens[0].strip()
+                    currVal = lineTokens[1].strip()
+
+                    backupDict[currKey] = currVal
+                else:
+                    self.nodeLogger.error("malformed line in node backup file: %s", backupLine)
+
+        return backupDict
 
     """
         Initialize the class using the config file provided and also initialize
@@ -60,6 +78,11 @@ class RaftNode(rpyc.Service):
 
     def __init__(self, configFilePath, nodeIdentityIndex):
         self.identityIndex = nodeIdentityIndex
+
+        self.isCandidate = False
+        self._leaderStatus = False
+        self.currTerm = 0
+        self.voteTarget = None  # who the node is voting for in the current term
 
         #set up logging
         nodeName = "raftNode_" + str(nodeIdentityIndex)
@@ -76,7 +99,24 @@ class RaftNode(rpyc.Service):
         self.nodeLogger.addHandler(logFileHandler)
         self.nodeLogger.addHandler(consoleHandler)
 
-        #todo check for stored node state that can be recovered
+
+        nodeStateBackupFilePath = self._constructNodeStateFilePath()
+        if os.path.exists(nodeStateBackupFilePath):
+            with open(nodeStateBackupFilePath, mode="r") as nodeBackup:
+                nodeStateBackup = self._loadNodeBackup(nodeBackup)
+
+                storedTermStr = nodeStateBackup.get(RaftNode.TERM_BACKUP_KEY)
+                if storedTermStr is not None:
+                    storedTermVal = int(storedTermStr)
+                    self.currTerm = storedTermVal
+
+                storedVoteStr = nodeStateBackup.get(RaftNode.VOTE_BACKUP_KEY)
+                if storedVoteStr is not None:
+                    storedVoteVal = int(storedVoteStr)
+                    self.voteTarget = storedVoteVal
+
+
+
         #todo? do I need to restore leader status?
 
         self.otherNodes = []
@@ -93,10 +133,6 @@ class RaftNode(rpyc.Service):
                     otherNode = NodeRef(otherNodeName, otherNodeHost, otherNodePort)
                     self.otherNodes.append(otherNode)
 
-        self.isCandidate = False
-        self._leaderStatus = False
-        self.currTerm = 0
-        self.voteTarget = None # who the node is voting for in the current term
 
         self.electionTimeout = (1+random.random())*RaftNode.ELECTION_TIMEOUT_BASELINE
         self.lastContactTimestamp = time.time()
