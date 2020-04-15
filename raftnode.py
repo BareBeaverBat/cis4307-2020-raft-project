@@ -29,8 +29,21 @@ class RaftNode(rpyc.Service):
 
     def __init__(self, configFilePath, nodeIdentityIndex):
         self.identityIndex = nodeIdentityIndex
-        nodeName = "node" + str(nodeIdentityIndex)
-        nodeLogger = None
+
+        #set up logging
+        nodeName = "raftNode_" + str(nodeIdentityIndex)
+        self.nodeLogger = logging.getLogger(nodeName)
+        self.nodeLogger.setLevel(logging.DEBUG)
+        logFileHandler = logging.FileHandler(nodeName + ".log")
+        logFileHandler.setLevel(logging.DEBUG)
+        consoleHandler = logging.StreamHandler()
+        consoleHandler.setLevel(logging.WARN)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        logFileHandler.setFormatter(formatter)
+        consoleHandler.setFormatter(formatter)
+        self.nodeLogger.addHandler(logFileHandler)
+        self.nodeLogger.addHandler(consoleHandler)
+
 
         self.otherNodes = []
         with open(configFilePath) as nodesConfigFile:
@@ -46,7 +59,7 @@ class RaftNode(rpyc.Service):
                     otherNode = NodeRef(otherNodeName, otherNodeHost, otherNodePort)
                     self.otherNodes.append(otherNode)
 
-        print("I am node %d and I just finished being constructed, with %d fellow nodes",
+        self.nodeLogger.debug("I am node %d and I just finished being constructed, with %d fellow nodes",
               self.identityIndex, len(self.otherNodes))
 
     '''
@@ -81,7 +94,7 @@ if __name__ == '__main__':
             nodeNumStr = nodeNumStr.strip()
             nodeNum = int(nodeNumStr)
         else:
-            logging.critical("invalid config file- bad initial node count line: %s", nodeNumLine)
+            print("invalid config file- bad initial node count line: %s" % nodeNumLine)
             raise Exception("bad config file")
 
         if currNodeIndex < nodeNum:
@@ -92,14 +105,12 @@ if __name__ == '__main__':
                 nodePortStr = nodeTerms[2].strip()
                 currNodePort = int(nodePortStr)
             else:
-                logging.critical("invalid config file- wrong number of lines of node descriptions", nodeNumLine)
+                print("invalid config file- wrong number of lines of node descriptions %s" % nodeNumLine)
                 raise Exception("bad config file")
         else:
-            # todo figure out how to log properly
-            logging.critical("unacceptably high index %d for node system which only has %d nodes", currNodeIndex,
-                             nodeNum)
+            print("unacceptably high index %d for node system which only has %d nodes" % (currNodeIndex, nodeNum))
             raise Exception("bad node index")
 
-    if (currNodePort > 0):
+    if currNodePort > 0:
         server = ThreadPoolServer(RaftNode(configFileName, currNodeIndex), port=currNodePort)
         server.start()
