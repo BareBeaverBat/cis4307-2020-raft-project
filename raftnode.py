@@ -16,12 +16,6 @@ class NodeRef:
         self.port = port
 
 
-class RpcReturn:
-    def __init__(self, termNum, outcomeBoolean):
-        self.term = termNum
-        self.boolResult = outcomeBoolean
-
-
 '''
 A RAFT RPC server class.
 
@@ -33,25 +27,37 @@ protocol.
 
 
 class RaftNode(rpyc.Service):
-    ELECTION_TIMEOUT_BASELINE = 0.150  # seconds to wait before calling an election
-    HEARTBEAT_INTERVAL = ELECTION_TIMEOUT_BASELINE / 5
+    ELECTION_TIMEOUT_BASELINE = 0.150*25  # seconds to wait before calling an election
+    HEARTBEAT_INTERVAL = ELECTION_TIMEOUT_BASELINE*0.75
     NODE_STATE_FOLDER = "node_states"
+    NODE_LOGS_FOLDER="node_logs"
 
     BACKUP_SEPARATOR = ":"
     TERM_BACKUP_KEY = "term"
     VOTE_BACKUP_KEY = "vote"
+    LEADER_BACKUP_KEY="isLeader"
+    BACKUP_TRUE_VALUE="true"
+    BACKUP_FALSE_VALUE = "false"
 
     def _construct_node_state_file_path(self):
-        pathStr = os.path.join(RaftNode.NODE_STATE_FOLDER, "node" + self.identityIndex + ".txt")
+        pathStr = os.path.join(RaftNode.NODE_STATE_FOLDER, "node" + str(self.identityIndex) + ".txt")
         return pathStr
 
     def _save_node_state(self):
+        if not os.path.exists(RaftNode.NODE_STATE_FOLDER):
+            os.makedirs(RaftNode.NODE_STATE_FOLDER)
+
         nodeStateStorageFilePath = self._construct_node_state_file_path()
         with open(nodeStateStorageFilePath, mode="w") as nodeStateStorageFile:
-            nodeState = RaftNode.TERM_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.currTerm) + "\n"
-            if self.voteTarget is not None:
-                nodeState += RaftNode.VOTE_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.voteTarget) + "\n"
-            nodeStateStorageFile.write(nodeState)
+            termLine = RaftNode.TERM_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.currTerm) + "\n"
+            nodeStateStorageFile.write(termLine)
+            voteTargetIndex = self.voteTarget if self.voteTarget is not None else -1
+            voteLine = RaftNode.VOTE_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(voteTargetIndex) + "\n"
+            nodeStateStorageFile.write(voteLine)
+            isLeaderVal = RaftNode.BACKUP_TRUE_VALUE if self.exposed_is_leader() else RaftNode.BACKUP_FALSE_VALUE
+            leaderLine = RaftNode.LEADER_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + isLeaderVal + "\n"
+            nodeStateStorageFile.write(leaderLine)
+
             nodeStateStorageFile.flush()
             os.fsync(nodeStateStorageFile.fileno())
 
@@ -93,7 +99,11 @@ class RaftNode(rpyc.Service):
         nodeName = "raftNode_" + str(nodeIdentityIndex)
         self.nodeLogger = logging.getLogger(nodeName)
         self.nodeLogger.setLevel(logging.DEBUG)
-        logFilePath = os.path.join("node_logs", nodeName + ".log")
+
+        if not os.path.exists(RaftNode.NODE_LOGS_FOLDER):
+            os.makedirs(RaftNode.NODE_LOGS_FOLDER)
+
+        logFilePath = os.path.join(RaftNode.NODE_LOGS_FOLDER, nodeName + ".log")
         logFileHandler = logging.FileHandler(logFilePath)
         logFileHandler.setLevel(logging.DEBUG)
         consoleHandler = logging.StreamHandler()
@@ -117,9 +127,13 @@ class RaftNode(rpyc.Service):
                 storedVoteStr = nodeStateBackup.get(RaftNode.VOTE_BACKUP_KEY)
                 if storedVoteStr is not None:
                     storedVoteVal = int(storedVoteStr)
-                    self.voteTarget = storedVoteVal
+                    if storedVoteVal >= 0:
+                        self.voteTarget = storedVoteVal
 
-                # todo? do I need to restore leader status?
+                storedLeaderStr = nodeStateBackup.get(RaftNode.LEADER_BACKUP_KEY)
+                if storedLeaderStr is not None and storedLeaderStr == RaftNode.BACKUP_TRUE_VALUE:
+                    self._leaderStatus = True
+
 
         self.otherNodes = []
         with open(configFilePath) as nodesConfigFile:
@@ -180,7 +194,7 @@ class RaftNode(rpyc.Service):
 
             willAppendEntries = True
 
-        return RpcReturn(self.currTerm, willAppendEntries)
+        return (self.currTerm, willAppendEntries)
 
     def call_append_entries(self, otherNodeDesc):
         assert self.exposed_is_leader()
@@ -188,7 +202,8 @@ class RaftNode(rpyc.Service):
 
         try:
             nodeConn = rpyc.connect(otherNodeDesc.host, otherNodeDesc.port)
-            appendEntriesRetVal = nodeConn.append_entries(self.currTerm, self.identityIndex)
+            otherNodeRoot = nodeConn.root
+            appendEntriesRetVal = otherNodeRoot.append_entries(self.currTerm, self.identityIndex)
         except Exception as e:
             self.nodeLogger.error("Exception for leader node %d in term %d: %s\n%s\n%s",
                                   self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
@@ -226,7 +241,7 @@ class RaftNode(rpyc.Service):
                 self._save_node_state()
                 willVote = True
 
-        return RpcReturn(self.currTerm, willVote)
+        return (self.currTerm, willVote)
 
     def call_request_vote(self, otherNode):
         assert self.isCandidate
@@ -234,7 +249,8 @@ class RaftNode(rpyc.Service):
 
         try:
             nodeConn = rpyc.connect(otherNode.host, otherNode.port)
-            requestVoteRetVal = nodeConn.request_vote(self.currTerm, self.identityIndex)
+            otherNodeRoot = nodeConn.root
+            requestVoteRetVal = otherNodeRoot.request_vote(self.currTerm, self.identityIndex)
         except Exception as e:
             self.nodeLogger.error("Exception for candidate node %d in term %d: %s\n%s\n%s",
                                   self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
@@ -263,9 +279,9 @@ class RaftNode(rpyc.Service):
 
                     if nodeVoteResponse is None:
                         nodesToContact.append(currOtherNode)
-                    elif nodeVoteResponse.boolResult:
+                    elif nodeVoteResponse[1]:
                         numVotes += 1
-                    elif nodeVoteResponse.term > self.currTerm:
+                    elif nodeVoteResponse[0] > self.currTerm:
                         self.isCandidate = False
                         self.currTerm = nodeVoteResponse.term
                         self._restart_timeout()
@@ -290,9 +306,9 @@ class RaftNode(rpyc.Service):
 
             if nodeHeartbeatResponse is None:
                 nodesToContact.append(currOtherNode)
-            elif nodeHeartbeatResponse.term > self.currTerm:
+            elif nodeHeartbeatResponse[0] > self.currTerm:
                 self._leaderStatus = False
-                self.currTerm = nodeHeartbeatResponse.term
+                self.currTerm = nodeHeartbeatResponse[0]
                 self._restart_timeout()
 
 

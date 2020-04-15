@@ -1,0 +1,3 @@
+N: 2
+node0: localhost:5001
+node1: localhost:5002
