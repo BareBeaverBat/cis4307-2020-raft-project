@@ -3,6 +3,7 @@ import os
 import random
 import threading
 import time
+import traceback
 
 import rpyc
 import sys
@@ -190,9 +191,14 @@ class RaftNode(rpyc.Service):
 
     def call_append_entries(self, otherNodeDesc):
         assert self.exposed_is_leader()
-        #todo handle callee failure
-        nodeConn = rpyc.connect(otherNodeDesc.host, otherNodeDesc.port)
-        appendEntriesRetVal = nodeConn.append_entries(self.currTerm, self.identityIndex)
+        appendEntriesRetVal = None
+
+        try:
+            nodeConn = rpyc.connect(otherNodeDesc.host, otherNodeDesc.port)
+            appendEntriesRetVal = nodeConn.append_entries(self.currTerm, self.identityIndex)
+        except Exception as e:
+            self.nodeLogger.error("Exception for leader node %d in term %d: %s\n%s\n%s",
+                                  self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
         return appendEntriesRetVal
 
 
@@ -243,9 +249,14 @@ class RaftNode(rpyc.Service):
 
     def call_request_vote(self, otherNode):
         assert self.isCandidate
-        #todo handle callee failure
-        nodeConn = rpyc.connect(otherNode.host, otherNode.port)
-        requestVoteRetVal = nodeConn.request_vote(self.currTerm, self.identityIndex)
+        requestVoteRetVal = None
+
+        try:
+            nodeConn = rpyc.connect(otherNode.host, otherNode.port)
+            requestVoteRetVal = nodeConn.request_vote(self.currTerm, self.identityIndex)
+        except Exception as e:
+            self.nodeLogger.error("Exception for candidate node %d in term %d: %s\n%s\n%s",
+                                  self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
         return requestVoteRetVal
 
 
