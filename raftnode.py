@@ -123,51 +123,67 @@ class RaftNode(rpyc.Service):
     def exposed_is_leader(self):
         return self._leaderStatus
 
-    def exposed_append_entries(self, requesterTerm, leaderIndex):
-        if(requesterTerm < self.currTerm):
-            self.nodeLogger.info("in term %d, received append_entries() from stale leader %d which thought it was in term %d", self.currTerm, leaderIndex, requesterTerm)
-            return RpcReturn(self.currTerm, False)
+    def exposed_append_entries(self, leaderTerm, leaderIndex):
+        willAppendEntries = False
+        if(leaderTerm < self.currTerm):
+            self.nodeLogger.info("in term %d, received append_entries() from stale leader %d which thought it was in term %d", self.currTerm, leaderIndex, leaderTerm)
+        else:
+            with self._lastContactTimestampLock:
+                self.lastContactTimestamp = time.time()
+                electionTimer = threading.Timer(self.electionTimeout, self.check_for_election_timeout)
+                electionTimer.start()
 
-        #todo update if term >
+            self.nodeLogger.debug("in term %d, executing append_entries on behalf of node %d, the leader in term %d",
+                                  self.currTerm, leaderIndex, leaderTerm)
 
-        self.nodeLogger.debug("in term %d, executing append_entries on behalf of node %d, the leader in term %d",
-                              self.currTerm, leaderIndex, requesterTerm)
-        with self._lastContactTimestampLock:
-            self.lastContactTimestamp = time.time()
+            if leaderTerm > self.currTerm:
+                if self.voteTarget is not None:
+                    self.nodeLogger.warning("was in election for term %d, voting for candidate node %d, "
+                                            "when received request to append entries in later term %d", self.currTerm,
+                                            self.voteTarget, leaderTerm)
+                    self.voteTarget = None
 
-        #todo finish?
+                self.isCandidate = False
+                self._leaderStatus = False
+                self.currTerm = leaderTerm
 
-    def call_append_entries(self, otherNode):
+            willAppendEntries = True
+
+
+        return RpcReturn(self.currTerm, willAppendEntries)
+
+    def call_append_entries(self, otherNodeDesc):
         assert self.exposed_is_leader()
-        nodeConn = rpyc.connect(otherNode.host, otherNode.port)
+        #todo handle callee failure
+        nodeConn = rpyc.connect(otherNodeDesc.host, otherNodeDesc.port)
         appendEntriesRetVal = nodeConn.append_entries(self.currTerm, self.identityIndex)
         return appendEntriesRetVal
 
 
 
 
-    def exposed_request_vote(self, requesterTerm, candidateIndex):
+    def exposed_request_vote(self, candidateTerm, candidateIndex):
         willVote = False
 
-        if requesterTerm < self.currTerm:
+        if candidateTerm < self.currTerm:
             self.nodeLogger.info(
                 "in term %d, received request_vote() from stale leader %d which thought it was in term %d",
-                self.currTerm, candidateIndex, requesterTerm)
+                self.currTerm, candidateIndex, candidateTerm)
         else:
             with self._lastContactTimestampLock:
                 self.lastContactTimestamp = time.time()
 
-            if requesterTerm > self.currTerm:
+            if candidateTerm > self.currTerm:
                 if self.voteTarget is not None:
                     self.nodeLogger.warning("was in election for term %d, voting for candidate node %d, "
                                             "when received request for vote in later term %d", self.currTerm,
-                                            self.voteTarget, requesterTerm)
+                                            self.voteTarget, candidateTerm)
                     self.voteTarget = None
                 # cast vote here?
 
                 self.isCandidate = False
                 self._leaderStatus = False
-                self.currTerm = requesterTerm
+                self.currTerm = candidateTerm
 
 
             else:
@@ -191,6 +207,7 @@ class RaftNode(rpyc.Service):
 
     def call_request_vote(self, otherNode):
         assert self.isCandidate
+        #todo handle callee failure
         nodeConn = rpyc.connect(otherNode.host, otherNode.port)
         requestVoteRetVal = nodeConn.request_vote(self.currTerm, self.identityIndex)
         return requestVoteRetVal
@@ -213,6 +230,8 @@ class RaftNode(rpyc.Service):
             numNodes = 1 + len(self.otherNodes)
 
             for otherNode in self.otherNodes:
+                #todo ask node for vote, handling call failure
+                nodeVoteResponse = self.call_request_vote(otherNode)
 
 
                 if not self.isCandidate:
