@@ -215,7 +215,9 @@ class RaftNode(rpyc.Service):
                 self._leaderStatus = False
                 self.currTerm = leaderTerm
 
-            self.nodeLogger.critical("acknowledging node %d as the leader for term %d", leaderIndex, self.currTerm)
+            if self.currLeader != leaderIndex:
+                self.nodeLogger.critical("acknowledging node %d as the leader for term %d", leaderIndex, self.currTerm)
+
             self.voteTarget = None
             self.currLeader = leaderIndex
             self._save_node_state()
