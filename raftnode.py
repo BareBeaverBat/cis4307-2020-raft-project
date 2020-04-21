@@ -215,6 +215,7 @@ class RaftNode(rpyc.Service):
                 self._leaderStatus = False
                 self.currTerm = leaderTerm
 
+            self.nodeLogger.critical("acknowledging node %d as the leader for term %d", leaderIndex, self.currTerm)
             self.voteTarget = None
             self.currLeader = leaderIndex
             self._save_node_state()
@@ -329,7 +330,8 @@ class RaftNode(rpyc.Service):
 
                 nodesToContact = self.otherNodes.copy()
 
-                while len(nodesToContact) > 0 and self.isCandidate and electionTerm == self.currTerm:
+                while len(nodesToContact) > 0 and self.isCandidate \
+                        and self.currLeader is None and electionTerm == self.currTerm:
                     currOtherNode = nodesToContact.pop(0)
                     nodeVoteResponse = self.call_request_vote(currOtherNode)
                     
@@ -338,7 +340,7 @@ class RaftNode(rpyc.Service):
                         nodesToContact.append(currOtherNode)
                     elif nodeVoteResponse[1]:
                         numVotes += 1
-                        self.nodeLogger.info("received vote from other node at port %d in term %d", currOtherNode.port,
+                        self.nodeLogger.critical("received vote from other node at port %d in term %d", currOtherNode.port,
                                              self.currTerm)
                     else:
                         responderTerm = nodeVoteResponse[0]
@@ -346,6 +348,8 @@ class RaftNode(rpyc.Service):
                             self.nodeLogger.critical("terminating election for term %d because a vote request response"
                                                  " informed this node of higher term %d", self.currTerm, responderTerm)
                             self.isCandidate = False
+                            self.voteTarget = None
+                            self.currLeader = None
                             self.currTerm = responderTerm
                             self._save_node_state()
                             self._restart_timeout()
@@ -356,6 +360,7 @@ class RaftNode(rpyc.Service):
                                                  self.currTerm, numVotes)
                         self._leaderStatus = True
                         self.isCandidate = False
+                        self.voteTarget = None
                         self.currLeader = self.identityIndex
                         self._save_node_state()
 
@@ -384,6 +389,7 @@ class RaftNode(rpyc.Service):
                                              "a heartbeat response informed it of a higher term %d",
                                              self.currTerm, responderTerm)
                         self._leaderStatus = False
+                        self.currLeader = None
                         self.currTerm = responderTerm
                         self._restart_timeout()
 
