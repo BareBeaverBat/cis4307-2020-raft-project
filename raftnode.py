@@ -134,7 +134,7 @@ class RaftNode(rpyc.Service):
                 if storedLeaderStr is not None and storedLeaderStr == RaftNode.BACKUP_TRUE_VALUE:
                     self._leaderStatus = True
             self.nodeLogger.info("loading backup of prior node state from disk:\n"
-                                 "term %d; voteTarget %d (-1 standing for None); and leader status %b", self.currTerm,
+                                 "term %d; voteTarget %d (-1 standing for None); and leader status %s", self.currTerm,
                                  self.voteTarget if self.voteTarget is not None else -1, self._leaderStatus)
 
         self.otherNodes = []
@@ -190,7 +190,7 @@ class RaftNode(rpyc.Service):
                                             self.voteTarget, leaderTerm)
                     self.voteTarget = None
 
-                self.nodeLogger.critical("was in term %d with candidate status %b and leader status %b when "
+                self.nodeLogger.critical("was in term %d with candidate status %s and leader status %s when "
                                          "received heartbeat from leader node %d in higher term %d", self.currTerm,
                                          self.isCandidate, self._leaderStatus, leaderIndex, leaderTerm)
                 self.isCandidate = False
@@ -239,7 +239,7 @@ class RaftNode(rpyc.Service):
                                             self.voteTarget, candidateTerm)
                     self.voteTarget = None
 
-                self.nodeLogger.critical("was in term %d with candidate status %b and leader status %b when "
+                self.nodeLogger.critical("was in term %d with candidate status %s and leader status %s when "
                                          "received request for vote in higher term %d", self.currTerm, self.isCandidate,
                                          self._leaderStatus, candidateTerm)
                 self.isCandidate = False
@@ -302,19 +302,21 @@ class RaftNode(rpyc.Service):
                 while len(nodesToContact) > 0 and self.isCandidate and electionTerm == self.currTerm:
                     currOtherNode = nodesToContact.pop(0)
                     nodeVoteResponse = self.call_request_vote(currOtherNode)
-                    responderTerm = nodeVoteResponse[0]
+                    
 
                     if nodeVoteResponse is None:
                         nodesToContact.append(currOtherNode)
                     elif nodeVoteResponse[1]:
                         numVotes += 1
-                    elif responderTerm > self.currTerm:
-                        self.nodeLogger.critical("terminating election for term %d because a vote request response"
-                                             " informed this node of higher term %d", self.currTerm, responderTerm)
-                        self.isCandidate = False
-                        self.currTerm = responderTerm
-                        self._save_node_state()
-                        self._restart_timeout()
+                    else:
+                        responderTerm = nodeVoteResponse[0]
+                        if responderTerm > self.currTerm:
+                            self.nodeLogger.critical("terminating election for term %d because a vote request response"
+                                                 " informed this node of higher term %d", self.currTerm, responderTerm)
+                            self.isCandidate = False
+                            self.currTerm = responderTerm
+                            self._save_node_state()
+                            self._restart_timeout()
 
                     # possible race condition with _leaderStatus?
                     if numVotes > numNodes / 2.0:
@@ -338,17 +340,19 @@ class RaftNode(rpyc.Service):
             while len(nodesToContact) > 0 and self.exposed_is_leader():
                 currOtherNode = nodesToContact.pop(0)
                 nodeHeartbeatResponse = self.call_append_entries(currOtherNode)
-                responderTerm = nodeHeartbeatResponse[0]
+                
 
                 if nodeHeartbeatResponse is None:
                     nodesToContact.append(currOtherNode)
-                elif responderTerm > self.currTerm:
-                    self.nodeLogger.critical("this node was leader in term %d but is abandoning that status because"
-                                         "a heartbeat response informed it of a higher term %d",
-                                         self.currTerm, responderTerm)
-                    self._leaderStatus = False
-                    self.currTerm = responderTerm
-                    self._restart_timeout()
+                else:
+                    responderTerm = nodeHeartbeatResponse[0]
+                    if responderTerm > self.currTerm:
+                        self.nodeLogger.critical("this node was leader in term %d but is abandoning that status because"
+                                             "a heartbeat response informed it of a higher term %d",
+                                             self.currTerm, responderTerm)
+                        self._leaderStatus = False
+                        self.currTerm = responderTerm
+                        self._restart_timeout()
 
 
 if __name__ == '__main__':
