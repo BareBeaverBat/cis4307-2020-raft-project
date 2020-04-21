@@ -155,6 +155,9 @@ class RaftNode(rpyc.Service):
                                  self.voteTarget if self.voteTarget is not None else -1,
                                  self.currLeader if self.currLeader is not None else -1, self._leaderStatus)
 
+            if self.exposed_is_leader() and self.currLeader != self.identityIndex:
+                self.nodeLogger.error("INVALID NODE STATE LOADED FROM DISK")
+
         self.otherNodes = []
         with open(configFilePath) as nodesConfigFile:
             nodesConfigFile.readline()  # ignore first line with node count
@@ -213,6 +216,7 @@ class RaftNode(rpyc.Service):
                                          self.isCandidate, self._leaderStatus, leaderIndex, leaderTerm)
                 self.isCandidate = False
                 self._leaderStatus = False
+                self.currLeader = None
                 self.currTerm = leaderTerm
 
             if self.currLeader != leaderIndex:
@@ -266,6 +270,7 @@ class RaftNode(rpyc.Service):
                                          self._leaderStatus, candidateTerm)
                 self.isCandidate = False
                 self._leaderStatus = False
+                self.currLeader = None
                 self.currTerm = candidateTerm
                 self._save_node_state()
             else:
