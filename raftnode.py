@@ -27,7 +27,7 @@ protocol.
 
 
 class RaftNode(rpyc.Service):
-    ELECTION_TIMEOUT_BASELINE = 0.150 * 25  # seconds to wait before calling an election
+    ELECTION_TIMEOUT_BASELINE = 0.150   # seconds to wait before calling an election
     HEARTBEAT_INTERVAL = ELECTION_TIMEOUT_BASELINE * 0.75
     NODE_STATE_FOLDER = "node_states"
     NODE_LOGS_FOLDER = "node_logs"
@@ -46,6 +46,7 @@ class RaftNode(rpyc.Service):
         return pathStr
 
     def _save_node_state(self):
+        # saveStartTime = time.time()
         if not os.path.exists(RaftNode.NODE_STATE_FOLDER):
             os.makedirs(RaftNode.NODE_STATE_FOLDER)
 
@@ -68,6 +69,9 @@ class RaftNode(rpyc.Service):
             nodeStateStorageFile.flush()
             os.fsync(nodeStateStorageFile.fileno())
 
+        # saveDuration = time.time() - saveStartTime
+        # self.nodeLogger.debug("saving node state took %f seconds", saveDuration)
+
     def _load_node_backup(self, backupFile):
         backupDict = {}
 
@@ -86,8 +90,12 @@ class RaftNode(rpyc.Service):
 
     def _restart_timeout(self):
         self.lastContactTimestamp = time.time()
+        # electionTimerStartupStartTime = time.time()
         electionTimer = threading.Timer(self.electionTimeout, self.check_for_election_timeout)
         electionTimer.start()
+
+        # electionTimerStartupDuration = time.time() - electionTimerStartupStartTime
+        # self.nodeLogger.debug("starting up an election timer took %f seconds", electionTimerStartupDuration)
 
     """
         Initialize the class using the config file provided and also initialize
@@ -105,7 +113,7 @@ class RaftNode(rpyc.Service):
         self.currLeader = None # who has been elected leader in the current term
 
         # set up logging
-        nodeName = "raftNode_" + str(nodeIdentityIndex)
+        nodeName = "raftNode" + str(nodeIdentityIndex)
         self.nodeLogger = logging.getLogger(nodeName)
         self.nodeLogger.setLevel(logging.DEBUG)
 
@@ -117,7 +125,7 @@ class RaftNode(rpyc.Service):
         logFileHandler.setLevel(logging.DEBUG)
         consoleHandler = logging.StreamHandler()
         consoleHandler.setLevel(logging.WARN)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        formatter = logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
         logFileHandler.setFormatter(formatter)
         consoleHandler.setFormatter(formatter)
         self.nodeLogger.addHandler(logFileHandler)
@@ -175,8 +183,11 @@ class RaftNode(rpyc.Service):
         self.electionTimeout = (1 + random.random()) * RaftNode.ELECTION_TIMEOUT_BASELINE
         self._restart_timeout()
 
-        self.nodeLogger.critical("I am node %d and I just finished being constructed, with %d fellow nodes",
-                                 self.identityIndex, len(self.otherNodes))
+        self.nodeLogger.critical("I am node %d (election timeout %f) and I just finished being constructed, with %d fellow nodes",
+                                 self.identityIndex, self.electionTimeout, len(self.otherNodes))
+        for otherNodeDesc in self.otherNodes:
+            self.nodeLogger.debug("other node %s is at host %s and port %d", otherNodeDesc.name, otherNodeDesc.host,
+                                  otherNodeDesc.port)
 
     '''
         x = is_leader(): returns True or False, depending on whether
@@ -233,19 +244,27 @@ class RaftNode(rpyc.Service):
         assert self.exposed_is_leader()
         appendEntriesRetVal = None
 
+        heartbeatRpcStartTime = time.time()
+
         try:
             nodeConn = rpyc.connect(otherNodeDesc.host, otherNodeDesc.port)
             otherNodeRoot = nodeConn.root
             appendEntriesRetVal = otherNodeRoot.append_entries(self.currTerm, self.identityIndex)
         except ConnectionRefusedError:
-            self.nodeLogger.info("leader node %d in term %d was unable to connect to another node with port %d",
-                                 self.identityIndex, self.currTerm, otherNodeDesc.port)
+            self.nodeLogger.info("leader node %d in term %d was unable to connect to another node %s",
+                                 self.identityIndex, self.currTerm, otherNodeDesc.name)
         except EOFError:
-            self.nodeLogger.info("leader node %d in term %d lost connection to another node with port %d",
-                                 self.identityIndex, self.currTerm, otherNodeDesc.port)
+            self.nodeLogger.info("leader node %d in term %d lost connection to another node %s",
+                                 self.identityIndex, self.currTerm, otherNodeDesc.name)
         except Exception as e:
             self.nodeLogger.error("Exception for leader node %d in term %d: %s\n%s\n%s",
                                   self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
+
+        heartbeatRpcDuration = time.time() - heartbeatRpcStartTime
+        self.nodeLogger.debug("calling append entries for other node %s took %f seconds", otherNodeDesc.name,
+                              heartbeatRpcDuration)
+
+
         return appendEntriesRetVal
 
     def exposed_request_vote(self, candidateTerm, candidateIndex):
@@ -273,6 +292,7 @@ class RaftNode(rpyc.Service):
                 self.currLeader = None
                 self.currTerm = candidateTerm
                 self._save_node_state()
+                self._restart_timeout()
             else:
                 if self.exposed_is_leader():
                     self.nodeLogger.warning("elected leader %d received request_vote() from candidate %d "
@@ -302,19 +322,26 @@ class RaftNode(rpyc.Service):
         assert self.isCandidate
         requestVoteRetVal = None
 
+        voteRequestRpcStartTime = time.time()
+
         try:
             nodeConn = rpyc.connect(otherNodeDesc.host, otherNodeDesc.port)
             otherNodeRoot = nodeConn.root
             requestVoteRetVal = otherNodeRoot.request_vote(self.currTerm, self.identityIndex)
         except ConnectionRefusedError as cre:
-            self.nodeLogger.info("candidate node %d in term %d was unable to connect to another node with port %d",
-                                 self.identityIndex, self.currTerm, otherNodeDesc.port)
+            self.nodeLogger.info("candidate node %d in term %d was unable to connect to another node %s",
+                                 self.identityIndex, self.currTerm, otherNodeDesc.name)
         except EOFError:
-            self.nodeLogger.info("candidate node %d in term %d lost connection to another node with port %d",
-                                 self.identityIndex, self.currTerm, otherNodeDesc.port)
+            self.nodeLogger.info("candidate node %d in term %d lost connection to another node %s",
+                                 self.identityIndex, self.currTerm, otherNodeDesc.name)
         except Exception as e:
             self.nodeLogger.error("Exception for candidate node %d in term %d: %s\n%s\n%s",
                                   self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
+
+        voteRequestRpcDuration = time.time() - voteRequestRpcStartTime
+        self.nodeLogger.debug("sending vote request to node %s took %f seconds", otherNodeDesc.name,
+                              voteRequestRpcDuration)
+
         return requestVoteRetVal
 
     def check_for_election_timeout(self):
@@ -337,9 +364,13 @@ class RaftNode(rpyc.Service):
 
                 nodesToContact = self.otherNodes.copy()
 
+                self.nodeLogger.debug("about to contact the %d other nodes", len(nodesToContact))
+
                 while len(nodesToContact) > 0 and self.isCandidate \
                         and self.currLeader is None and electionTerm == self.currTerm:
                     currOtherNode = nodesToContact.pop(0)
+                    self.nodeLogger.debug("sending vote request to node %s, with %d more nodes "
+                                          "to be contacted afterwards", currOtherNode.name, len(nodesToContact))
                     nodeVoteResponse = self.call_request_vote(currOtherNode)
                     
 
@@ -347,7 +378,7 @@ class RaftNode(rpyc.Service):
                         nodesToContact.append(currOtherNode)
                     elif nodeVoteResponse[1]:
                         numVotes += 1
-                        self.nodeLogger.critical("received vote from other node at port %d in term %d", currOtherNode.port,
+                        self.nodeLogger.critical("received vote from other node %s in term %d", currOtherNode.name,
                                              self.currTerm)
                     else:
                         responderTerm = nodeVoteResponse[0]
@@ -382,10 +413,15 @@ class RaftNode(rpyc.Service):
             heartbeatTimer.start()
 
             nodesToContact = self.otherNodes.copy()
+
+            self.nodeLogger.debug("about to contact the %d other nodes", len(nodesToContact))
+
             while len(nodesToContact) > 0 and self.exposed_is_leader():
                 currOtherNode = nodesToContact.pop(0)
+                self.nodeLogger.debug("sending heartbeat to node %s, with %d more nodes to be contacted "
+                                      "afterwards", currOtherNode.name, len(nodesToContact))
                 nodeHeartbeatResponse = self.call_append_entries(currOtherNode)
-                
+
 
                 if nodeHeartbeatResponse is None:
                     nodesToContact.append(currOtherNode)
