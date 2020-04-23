@@ -27,7 +27,7 @@ protocol.
 
 
 class RaftNode(rpyc.Service):
-    ELECTION_TIMEOUT_BASELINE = 0.150   # seconds to wait before calling an election
+    ELECTION_TIMEOUT_BASELINE = 0.150*15   # seconds to wait before calling an election
     HEARTBEAT_INTERVAL = ELECTION_TIMEOUT_BASELINE * 0.75
     NODE_STATE_FOLDER = "node_states"
     NODE_LOGS_FOLDER = "node_logs"
@@ -41,6 +41,7 @@ class RaftNode(rpyc.Service):
     BACKUP_TRUE_VALUE = "true"
     BACKUP_FALSE_VALUE = "false"
 
+    #todo convert this to instance-level constant defined in constructor
     def _construct_node_state_file_path(self):
         pathStr = os.path.join(RaftNode.NODE_STATE_FOLDER, "node" + str(self.identityIndex) + ".txt")
         return pathStr
@@ -51,6 +52,9 @@ class RaftNode(rpyc.Service):
             os.makedirs(RaftNode.NODE_STATE_FOLDER)
 
         nodeStateStorageFilePath = self._construct_node_state_file_path()
+
+        self.stateFileLock.acquire()
+
         with open(nodeStateStorageFilePath, mode="w") as nodeStateStorageFile:
             termLine = RaftNode.TERM_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.currTerm) + "\n"
             nodeStateStorageFile.write(termLine)
@@ -68,6 +72,8 @@ class RaftNode(rpyc.Service):
 
             nodeStateStorageFile.flush()
             os.fsync(nodeStateStorageFile.fileno())
+
+        self.stateFileLock.release()
 
         # saveDuration = time.time() - saveStartTime
         # self.nodeLogger.debug("saving node state took %f seconds", saveDuration)
@@ -111,6 +117,11 @@ class RaftNode(rpyc.Service):
         self.currTerm = 0
         self.voteTarget = None  # who the node is voting for in the current term
         self.currLeader = None # who has been elected leader in the current term
+
+        # should these not be reentrant?
+        self.stateFileLock = threading.RLock()
+        self.stateLock = threading.RLock()
+
 
         # set up logging
         nodeName = "raftNode" + str(nodeIdentityIndex)
@@ -204,6 +215,18 @@ class RaftNode(rpyc.Service):
 
     def exposed_append_entries(self, leaderTerm, leaderIndex):
         willAppendEntries = False
+
+        appendEntriesStartTime = time.time()
+
+        self.nodeLogger.debug("about to acquire LOCK to execute append_entries RPC for leader node %d "
+                              "which was in term %d", leaderIndex, leaderTerm)
+        self.stateLock.acquire()
+        self.nodeLogger.debug("successfully acquired LOCK to execute append_entries RPC for leader node %d "
+                              "which was in term %d", leaderIndex, leaderTerm)
+
+
+        termAtStartOfAppendEntries = self.currTerm
+
         if leaderTerm < self.currTerm:
             self.nodeLogger.info(
                 "while in term %d, received append_entries() from stale leader %d which thought it was in term %d",
@@ -238,6 +261,15 @@ class RaftNode(rpyc.Service):
             self._save_node_state()
             willAppendEntries = True
 
+        self.nodeLogger.debug("releasing LOCK after executing append_entries RPC for leader node %d "
+                              "which was in term %d", leaderIndex, leaderTerm)
+        self.stateLock.release()
+
+        appendEntriesDuration = time.time() - appendEntriesStartTime
+        self.nodeLogger.debug("while starting in term %d, executing append_entries for leader node %d "
+                              "which was in term %d took %f seconds", termAtStartOfAppendEntries, leaderIndex,
+                              leaderTerm, appendEntriesDuration)
+
         return (self.currTerm, willAppendEntries)
 
     def call_append_entries(self, otherNodeDesc):
@@ -261,7 +293,7 @@ class RaftNode(rpyc.Service):
                                   self.identityIndex, self.currTerm, e.__doc__, str(e), traceback.format_exc())
 
         heartbeatRpcDuration = time.time() - heartbeatRpcStartTime
-        self.nodeLogger.debug("calling append entries for other node %s took %f seconds", otherNodeDesc.name,
+        self.nodeLogger.debug("sending append_entries to other node %s took %f seconds", otherNodeDesc.name,
                               heartbeatRpcDuration)
 
 
@@ -269,6 +301,16 @@ class RaftNode(rpyc.Service):
 
     def exposed_request_vote(self, candidateTerm, candidateIndex):
         willVote = False
+
+        voteRequestStartTime = time.time()
+
+        self.nodeLogger.debug("about to acquire LOCK to execute request_vote RPC for candidate node %d "
+                              "which was in term %d", candidateIndex, candidateTerm)
+        self.stateLock.acquire()
+        self.nodeLogger.debug("successfully acquired LOCK to execute request_vote RPC for candidate node %d "
+                              "which was in term %d", candidateIndex, candidateTerm)
+
+        termAtStartOfVoteRequest = self.currTerm
 
         if candidateTerm < self.currTerm:
             self.nodeLogger.info("while in term %d, received request_vote() from stale candidate %d "
@@ -316,6 +358,14 @@ class RaftNode(rpyc.Service):
                 self._save_node_state()
                 willVote = True
 
+        self.nodeLogger.debug("releasing LOCK after executing request_vote RPC for candidate node %d "
+                              "which was in term %d", candidateIndex, candidateTerm)
+        self.stateLock.release()
+
+        voteRequestDuration = time.time() - voteRequestStartTime
+        self.nodeLogger.debug("while starting in term %d, executing request_vote for candidate node %d which was in term %d "
+                              "took %f seconds", termAtStartOfVoteRequest, candidateIndex, candidateTerm, voteRequestDuration)
+
         return (self.currTerm, willVote)
 
     def call_request_vote(self, otherNodeDesc):
@@ -345,8 +395,13 @@ class RaftNode(rpyc.Service):
         return requestVoteRetVal
 
     def check_for_election_timeout(self):
+        self.nodeLogger.debug("about to acquire LOCK to check for election timeout")
+        self.stateLock.acquire()
+        self.nodeLogger.debug("successfully acquired LOCK to check for election timeout")
+
         if self.exposed_is_leader():
-            self.nodeLogger.info("this node is ignoring an election timeout because it's the leader")
+            self.nodeLogger.info("this node is ignoring an election timeout because it's the leader and so releases the LOCK")
+            self.stateLock.release()
         else:
             self.nodeLogger.debug("checking whether election should be started")
             if (time.time() - self.lastContactTimestamp) > self.electionTimeout:
@@ -359,6 +414,8 @@ class RaftNode(rpyc.Service):
 
                 self.nodeLogger.critical("starting election for the new term %d", self.currTerm)
                 electionTerm = self.currTerm
+
+
                 numVotes = 1
                 numNodes = 1 + len(self.otherNodes)
 
@@ -366,13 +423,43 @@ class RaftNode(rpyc.Service):
 
                 self.nodeLogger.debug("about to contact the %d other nodes", len(nodesToContact))
 
-                while len(nodesToContact) > 0 and self.isCandidate \
-                        and self.currLeader is None and electionTerm == self.currTerm:
+                self.nodeLogger.debug("releasing the LOCK after starting election for term %d", self.currTerm)
+                self.stateLock.release()
+
+                while len(nodesToContact) > 0:
                     currOtherNode = nodesToContact.pop(0)
+
+                    self.nodeLogger.debug("about to acquire LOCK to send vote request to node %s", currOtherNode.name)
+                    self.stateLock.acquire()
+                    self.nodeLogger.debug("successfully acquired LOCK to send vote request to node %s", currOtherNode.name)
+
+                    if not self.isCandidate or self.currLeader is not None or electionTerm != self.currTerm:
+                        self.nodeLogger.debug("releasing LOCK (before contacting node %s) as part of terminating the "
+                                              "election which was running for term %d", currOtherNode.name, electionTerm)
+                        self.stateLock.release()
+                        break
+
+                    self.nodeLogger.debug("releasing LOCK just before requesting vote from node %s", currOtherNode.name)
+                    self.stateLock.release()
+
+
                     self.nodeLogger.debug("sending vote request to node %s, with %d more nodes "
                                           "to be contacted afterwards", currOtherNode.name, len(nodesToContact))
                     nodeVoteResponse = self.call_request_vote(currOtherNode)
-                    
+
+
+                    self.nodeLogger.debug("acquiring LOCK in order to process results of requesting vote from node %s",
+                                          currOtherNode.name)
+                    self.stateLock.acquire()
+                    self.nodeLogger.debug("successfully acquired LOCK in order to process results of requesting vote from node %s",
+                                          currOtherNode.name)
+
+                    if not self.isCandidate or self.currLeader is not None or electionTerm != self.currTerm:
+                        self.nodeLogger.debug("releasing LOCK (after contacting node %s) as part of terminating the "
+                                              "election which was running for term %d", currOtherNode.name, electionTerm)
+                        self.stateLock.release()
+                        break
+
 
                     if nodeVoteResponse is None:
                         nodesToContact.append(currOtherNode)
@@ -402,25 +489,69 @@ class RaftNode(rpyc.Service):
                         self.currLeader = self.identityIndex
                         self._save_node_state()
 
+                        #releases lock before control flow leaves this function
+                        self.nodeLogger.debug("releasing the LOCK after winning election for term %d", self.currTerm)
+                        self.stateLock.release()
+
                         self.send_heartbeats()
 
+                    #handles lock releasing in all cases except the one where this node just won an election
+                    if numVotes <= numNodes / 2.0:
+                        self.nodeLogger.debug("releasing LOCK after contacting a node %s", currOtherNode.name)
+                        self.stateLock.release()
+            else:
+                self.nodeLogger.debug("releasing LOCK after finding that it isn't time for an election yet")
+                self.stateLock.release()
+
     def send_heartbeats(self):
+
+        self.stateLock.acquire()
+
         if not self.exposed_is_leader():
-            self.nodeLogger.warning("in term %d, node attempted to send heartbeats out despite not being the leader",
+            self.nodeLogger.warning("in term %d, node attempted to send heartbeats out despite not being the leader (and releases the LOCK)",
                                     self.currTerm)
+            self.stateLock.release()
         else:
             heartbeatTimer = threading.Timer(RaftNode.HEARTBEAT_INTERVAL, self.send_heartbeats)
             heartbeatTimer.start()
 
+            leaderTerm = self.currTerm
+
             nodesToContact = self.otherNodes.copy()
 
-            self.nodeLogger.debug("about to contact the %d other nodes", len(nodesToContact))
+            self.nodeLogger.debug("release the LOCK just before contacting the %d other nodes", len(nodesToContact))
 
-            while len(nodesToContact) > 0 and self.exposed_is_leader():
+            self.stateLock.release()
+
+            while len(nodesToContact) > 0:
                 currOtherNode = nodesToContact.pop(0)
+
+                self.nodeLogger.debug("acquiring the LOCK to send heartbeat to node %s", currOtherNode.name)
+                self.stateLock.acquire()
+                self.nodeLogger.debug("successfully acquired the LOCK to send heartbeat to node %s", currOtherNode.name)
+
+                if not self.exposed_is_leader():
+                    self.nodeLogger.info("former leader (from term %d) is releasing the LOCK rather than try to send any more heartbeats (before trying to contact node %s)", leaderTerm, currOtherNode.name)
+                    self.stateLock.release()
+                    break
+
+                self.nodeLogger.debug("releasing LOCK just before sending heartbeat to node %s", currOtherNode.name)
+                self.stateLock.release()
+
+
                 self.nodeLogger.debug("sending heartbeat to node %s, with %d more nodes to be contacted "
                                       "afterwards", currOtherNode.name, len(nodesToContact))
                 nodeHeartbeatResponse = self.call_append_entries(currOtherNode)
+
+
+                self.nodeLogger.debug("acquiring the LOCK to process node %s 's response to a heartbeat", currOtherNode.name)
+                self.stateLock.acquire()
+                self.nodeLogger.debug("successfully acquired the LOCK to process node %s 's response to a heartbeat", currOtherNode.name)
+
+                if not self.exposed_is_leader():
+                    self.nodeLogger.info("former leader (from term %d) is releasing the LOCK rather than try to send any more heartbeats (after trying to contact node %s)", leaderTerm, currOtherNode.name)
+                    self.stateLock.release()
+                    break
 
 
                 if nodeHeartbeatResponse is None:
@@ -435,6 +566,9 @@ class RaftNode(rpyc.Service):
                         self.currLeader = None
                         self.currTerm = responderTerm
                         self._restart_timeout()
+
+                self.nodeLogger.debug("releasing the LOCK after sending heartbeat to node %s", currOtherNode.name)
+                self.stateLock.release()
 
 
 if __name__ == '__main__':
