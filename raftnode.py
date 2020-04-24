@@ -32,7 +32,12 @@ protocol.
 
 
 class RaftNode(rpyc.Service):
-    ELECTION_TIMEOUT_BASELINE = 0.3   #used to calculate the seconds to wait before calling an election, based on communication delay for contacting 1 active node
+    # used to calculate the seconds to wait before calling an election,
+    #  based on typical round-trip communication delay for contacting 1 active node
+    ELECTION_TIMEOUT_BASELINE = 0.3
+    # how long to wait when making a connection to another node before giving up and assuming the other node is down
+    #  also used to limit the delay if an RPC somehow got stuck partway through, but that's highly unlikely
+    #  since RPC execution time (on the other node) is 2-5 ms
     CONNECTION_TIMEOUT = 0.35
 
     NODE_STATE_FOLDER = "node_states"
@@ -43,38 +48,23 @@ class RaftNode(rpyc.Service):
     VOTE_BACKUP_KEY = "vote"
     CURR_LEADER_BACKUP_KEY = "currLeader"
 
-    LEADER_STATUS_BACKUP_KEY = "isLeader"
-    BACKUP_TRUE_VALUE = "true"
-    BACKUP_FALSE_VALUE = "false"
-
-    #todo convert this to instance-level constant defined in constructor
-    def _construct_node_state_file_path(self):
-        pathStr = os.path.join(RaftNode.NODE_STATE_FOLDER, "node" + str(self.identityIndex) + ".txt")
-        return pathStr
-
     def _save_node_state(self):
         # saveStartTime = time.time()
         if not os.path.exists(RaftNode.NODE_STATE_FOLDER):
             os.makedirs(RaftNode.NODE_STATE_FOLDER)
 
-        nodeStateStorageFilePath = self._construct_node_state_file_path()
-
         self.stateFileLock.acquire()
 
-        with open(nodeStateStorageFilePath, mode="w") as nodeStateStorageFile:
+        with open(self.nodeStateFilePath, mode="w") as nodeStateStorageFile:
             termLine = RaftNode.TERM_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.currTerm) + "\n"
             nodeStateStorageFile.write(termLine)
             voteTargetIndex = self.voteTarget if self.voteTarget is not None else -1
             voteLine = RaftNode.VOTE_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(voteTargetIndex) + "\n"
             nodeStateStorageFile.write(voteLine)
 
-            currLeaderIndex = self.currLeader if self.currLeader is not None else -1
+            currLeaderIndex = self.currLeader or -1
             currLeaderLine = RaftNode.CURR_LEADER_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(currLeaderIndex) + "\n"
             nodeStateStorageFile.write(currLeaderLine)
-
-            isLeaderVal = RaftNode.BACKUP_TRUE_VALUE if self.exposed_is_leader() else RaftNode.BACKUP_FALSE_VALUE
-            leaderLine = RaftNode.LEADER_STATUS_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + isLeaderVal + "\n"
-            nodeStateStorageFile.write(leaderLine)
 
             nodeStateStorageFile.flush()
             os.fsync(nodeStateStorageFile.fileno())
@@ -118,8 +108,6 @@ class RaftNode(rpyc.Service):
         self.identityIndex = nodeIdentityIndex
 
         self.isCandidate = False
-        #todo eliminate _leaderStatus in favor of using currLeader only
-        self._leaderStatus = False
         self.currTerm = 0
         self.voteTarget = None  # who the node is voting for in the current term
         self.currLeader = None # who has been elected leader in the current term
@@ -128,6 +116,7 @@ class RaftNode(rpyc.Service):
         self.stateFileLock = threading.RLock()
         self.stateLock = threading.RLock()
 
+        self.nodeStateFilePath = os.path.join(RaftNode.NODE_STATE_FOLDER, "node" + str(self.identityIndex) + ".txt")
 
         # set up logging
         nodeName = "raftNode" + str(nodeIdentityIndex)
@@ -148,9 +137,8 @@ class RaftNode(rpyc.Service):
         self.nodeLogger.addHandler(logFileHandler)
         self.nodeLogger.addHandler(consoleHandler)
 
-        nodeStateBackupFilePath = self._construct_node_state_file_path()
-        if os.path.exists(nodeStateBackupFilePath):
-            with open(nodeStateBackupFilePath, mode="r") as nodeBackup:
+        if os.path.exists(self.nodeStateFilePath):
+            with open(self.nodeStateFilePath, mode="r") as nodeBackup:
                 nodeStateBackup = self._load_node_backup(nodeBackup)
 
                 storedTermStr = nodeStateBackup.get(RaftNode.TERM_BACKUP_KEY)
@@ -170,18 +158,10 @@ class RaftNode(rpyc.Service):
                     if storedCurrLeaderVal >= 0:
                         self.currLeader = storedCurrLeaderVal
 
-                storedLeaderStatusStr = nodeStateBackup.get(RaftNode.LEADER_STATUS_BACKUP_KEY)
-                if storedLeaderStatusStr is not None and storedLeaderStatusStr == RaftNode.BACKUP_TRUE_VALUE:
-                    self._leaderStatus = True
-
             self.nodeLogger.info("loading backup of prior node state from disk:\n"
                                  "term %d; voteTarget %d (-1 standing for None); "
-                                 "current leader %d (-1 standing for None); and leader status %s", self.currTerm,
-                                 self.voteTarget if self.voteTarget is not None else -1,
-                                 self.currLeader if self.currLeader is not None else -1, self._leaderStatus)
-
-            if self.exposed_is_leader() and self.currLeader != self.identityIndex:
-                self.nodeLogger.error("INVALID NODE STATE LOADED FROM DISK")
+                                 "current leader %d (-1 standing for None)", self.currTerm,
+                                 self.voteTarget or -1, self.currLeader or -1)
 
         self.otherNodes = []
         with open(configFilePath) as nodesConfigFile:
@@ -233,7 +213,7 @@ class RaftNode(rpyc.Service):
     '''
 
     def exposed_is_leader(self):
-        return self._leaderStatus
+        return self.currLeader == self.identityIndex
 
     def exposed_append_entries(self, leaderTerm, leaderIndex):
         willAppendEntries = False
@@ -267,11 +247,10 @@ class RaftNode(rpyc.Service):
                                             self.voteTarget, leaderTerm)
                     self.voteTarget = None
 
-                self.nodeLogger.critical("was in term %d with candidate status %s and leader status %s when "
+                self.nodeLogger.critical("was in term %d with candidate status %s and current leader index %d when "
                                          "received heartbeat from leader node %d in higher term %d", self.currTerm,
-                                         self.isCandidate, self._leaderStatus, leaderIndex, leaderTerm)
+                                         self.isCandidate, self.currLeader or -1, leaderIndex, leaderTerm)
                 self.isCandidate = False
-                self._leaderStatus = False
                 self.currLeader = None
                 self.currTerm = leaderTerm
 
@@ -295,7 +274,7 @@ class RaftNode(rpyc.Service):
         return (self.currTerm, willAppendEntries)
 
     def call_append_entries(self, otherNodeDesc):
-        assert self.exposed_is_leader()
+        # assert self.exposed_is_leader() this might not always be true because of concurrency
         appendEntriesRetVal = None
 
         heartbeatRpcStartTime = time.time()
@@ -355,11 +334,10 @@ class RaftNode(rpyc.Service):
                                             self.voteTarget, candidateTerm)
                     self.voteTarget = None
 
-                self.nodeLogger.critical("was in term %d with candidate status %s and leader status %s when "
+                self.nodeLogger.critical("was in term %d with candidate status %s and current leader index %d when "
                                          "received request for vote in higher term %d", self.currTerm, self.isCandidate,
-                                         self._leaderStatus, candidateTerm)
+                                         self.currLeader or -1, candidateTerm)
                 self.isCandidate = False
-                self._leaderStatus = False
                 self.currLeader = None
                 self.currTerm = candidateTerm
                 self._save_node_state()
@@ -378,8 +356,7 @@ class RaftNode(rpyc.Service):
                                             "are in term %d but another node %d has already been elected leader",
                                             self.identityIndex, candidateIndex, self.currTerm, self.currLeader)
 
-            if not self.exposed_is_leader() and not self.isCandidate \
-                    and self.currLeader is None and self.voteTarget is None:
+            if not self.isCandidate and self.currLeader is None and self.voteTarget is None:
                 self.nodeLogger.critical("casting vote for candidate node %d in term %d", candidateIndex, self.currTerm)
                 self._restart_timeout()
 
@@ -519,7 +496,6 @@ class RaftNode(rpyc.Service):
                     if numVotes > numNodes / 2.0:
                         self.nodeLogger.critical("becoming the leader for the term %d with %d votes!!!",
                                                  self.currTerm, numVotes)
-                        self._leaderStatus = True
                         self.isCandidate = False
                         self.voteTarget = None
                         self.currLeader = self.identityIndex
@@ -598,7 +574,6 @@ class RaftNode(rpyc.Service):
                         self.nodeLogger.critical("this node was leader in term %d but is abandoning that status because "
                                              "a heartbeat response informed it of a higher term %d",
                                              self.currTerm, responderTerm)
-                        self._leaderStatus = False
                         self.currLeader = None
                         self.currTerm = responderTerm
                         self._restart_timeout()
