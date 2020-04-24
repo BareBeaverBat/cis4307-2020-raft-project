@@ -48,57 +48,6 @@ class RaftNode(rpyc.Service):
     VOTE_BACKUP_KEY = "vote"
     CURR_LEADER_BACKUP_KEY = "currLeader"
 
-    def _save_node_state(self):
-        # saveStartTime = time.time()
-        if not os.path.exists(RaftNode.NODE_STATE_FOLDER):
-            os.makedirs(RaftNode.NODE_STATE_FOLDER)
-
-        self.stateFileLock.acquire()
-
-        with open(self.nodeStateFilePath, mode="w") as nodeStateStorageFile:
-            termLine = RaftNode.TERM_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.currTerm) + "\n"
-            nodeStateStorageFile.write(termLine)
-            voteTargetIndex = self.voteTarget if self.voteTarget is not None else -1
-            voteLine = RaftNode.VOTE_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(voteTargetIndex) + "\n"
-            nodeStateStorageFile.write(voteLine)
-
-            currLeaderIndex = self.currLeader or -1
-            currLeaderLine = RaftNode.CURR_LEADER_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(currLeaderIndex) + "\n"
-            nodeStateStorageFile.write(currLeaderLine)
-
-            nodeStateStorageFile.flush()
-            os.fsync(nodeStateStorageFile.fileno())
-
-        self.stateFileLock.release()
-
-        # saveDuration = time.time() - saveStartTime
-        # self.nodeLogger.debug("saving node state took %f seconds", saveDuration)
-
-    def _load_node_backup(self, backupFile):
-        backupDict = {}
-
-        for backupLine in backupFile:
-            if backupLine != "":
-                lineTokens = backupLine.split(RaftNode.BACKUP_SEPARATOR)
-                if len(lineTokens) == 2:
-                    currKey = lineTokens[0].strip()
-                    currVal = lineTokens[1].strip()
-
-                    backupDict[currKey] = currVal
-                else:
-                    self.nodeLogger.error("malformed line in node backup file: %s", backupLine)
-
-        return backupDict
-
-    def _restart_timeout(self):
-        self.lastContactTimestamp = time.time()
-        # electionTimerStartupStartTime = time.time()
-        electionTimer = threading.Timer(self.electionTimeout, self.check_for_election_timeout)
-        electionTimer.start()
-
-        # electionTimerStartupDuration = time.time() - electionTimerStartupStartTime
-        # self.nodeLogger.debug("starting up an election timer took %f seconds", electionTimerStartupDuration)
-
     """
         Initialize the class using the config file provided and also initialize
         any datastructures you may need.
@@ -192,7 +141,7 @@ class RaftNode(rpyc.Service):
                                RaftNode.ELECTION_TIMEOUT_BASELINE*numVotesNeeded
         #todo try 0.5-1.5 rather than 1-2 or 0.75-1.75
         self.electionTimeout = (1 + random.random())*minimumElectionTimeout
-        self._restart_timeout()
+        self._restart_timer()
 
         self.heartbeatInterval = 0.5*minimumElectionTimeout
 
@@ -202,20 +151,78 @@ class RaftNode(rpyc.Service):
             self.nodeLogger.debug("other node %s is at host %s and port %d", otherNodeDesc.name, otherNodeDesc.host,
                                   otherNodeDesc.port)
 
-    '''
-        x = is_leader(): returns True or False, depending on whether
-        this node is a leader
-    
-        As per rpyc syntax, adding the prefix 'exposed_' will expose this
-        method as an RPC call
-    
-        CHANGE THIS METHOD TO RETURN THE APPROPRIATE RESPONSE
-    '''
+    def _save_node_state(self):
+        '''writes node state to disk'''
+        # saveStartTime = time.time()
+        if not os.path.exists(RaftNode.NODE_STATE_FOLDER):
+            os.makedirs(RaftNode.NODE_STATE_FOLDER)
+
+        self.stateFileLock.acquire()
+
+        with open(self.nodeStateFilePath, mode="w") as nodeStateStorageFile:
+            termLine = RaftNode.TERM_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(self.currTerm) + "\n"
+            nodeStateStorageFile.write(termLine)
+            voteTargetIndex = self.voteTarget if self.voteTarget is not None else -1
+            voteLine = RaftNode.VOTE_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(voteTargetIndex) + "\n"
+            nodeStateStorageFile.write(voteLine)
+
+            currLeaderIndex = self.currLeader or -1
+            currLeaderLine = RaftNode.CURR_LEADER_BACKUP_KEY + RaftNode.BACKUP_SEPARATOR + str(currLeaderIndex) + "\n"
+            nodeStateStorageFile.write(currLeaderLine)
+
+            nodeStateStorageFile.flush()
+            os.fsync(nodeStateStorageFile.fileno())
+
+        self.stateFileLock.release()
+
+        # saveDuration = time.time() - saveStartTime
+        # self.nodeLogger.debug("saving node state took %f seconds", saveDuration)
+
+    def _load_node_backup(self, backupFile):
+        '''reads a list of key-value pairs from the file containing a backup of the node's state
+        :return: that list of key-value pairs of state information'''
+        backupDict = {}
+
+        for backupLine in backupFile:
+            if backupLine != "":
+                lineTokens = backupLine.split(RaftNode.BACKUP_SEPARATOR)
+                if len(lineTokens) == 2:
+                    currKey = lineTokens[0].strip()
+                    currVal = lineTokens[1].strip()
+
+                    backupDict[currKey] = currVal
+                else:
+                    self.nodeLogger.error("malformed line in node backup file: %s", backupLine)
+
+        return backupDict
+
+    def _restart_timer(self):
+        '''resets the election timer'''
+        self.lastContactTimestamp = time.time()
+        # electionTimerStartupStartTime = time.time()
+        electionTimer = threading.Timer(self.electionTimeout, self.check_for_election_timeout)
+        electionTimer.start()
+
+        # electionTimerStartupDuration = time.time() - electionTimerStartupStartTime
+        # self.nodeLogger.debug("starting up an election timer took %f seconds", electionTimerStartupDuration)
+
+
 
     def exposed_is_leader(self):
+        '''returns whether this node is a leader
+        Meant to be called as RPC
+        :return boolean: whether this node is a leader
+        '''
         return self.currLeader == self.identityIndex
 
     def exposed_append_entries(self, leaderTerm, leaderIndex):
+        '''tries to reset this node's election timer on behalf of an RPC-caller node that thinks it's the current leader
+        Meant to be called as RPC
+        :param leaderTerm int:  the term which the caller thinks is most recent
+        :param leaderIndex int: the index of the node which thinks it's the leader & is sending a heartbeat to this node
+        :return tuple(int, boolean): what term this node thinks is most recent and whether this node is recognizing
+        the caller of the RPC as the leader
+        '''
         willAppendEntries = False
 
         appendEntriesStartTime = time.time()
@@ -238,7 +245,7 @@ class RaftNode(rpyc.Service):
                 "while in term %d, executing append_entries on behalf of node %d, the leader in term %d",
                 self.currTerm, leaderIndex, leaderTerm)
 
-            self._restart_timeout()
+            self._restart_timer()
 
             if leaderTerm > self.currTerm:
                 if self.voteTarget is not None:
@@ -274,6 +281,11 @@ class RaftNode(rpyc.Service):
         return (self.currTerm, willAppendEntries)
 
     def call_append_entries(self, otherNodeDesc):
+        '''send an append_entries/heartbeat 'message' to another node by calling that RPC on that node
+        :param otherNodeDesc NodeRef: a description of the other node
+        :return tuple(int, boolean): what term the other node thinks is most recent and whether the other node accepts
+        this node as the leader
+        '''
         # assert self.exposed_is_leader() this might not always be true because of concurrency
         appendEntriesRetVal = None
 
@@ -308,6 +320,14 @@ class RaftNode(rpyc.Service):
         return appendEntriesRetVal
 
     def exposed_request_vote(self, candidateTerm, candidateIndex):
+        '''tries to get this node's vote in an election on behalf of an RPC-caller node which is a candidate in that election
+        Meant to be called as RPC
+
+        :param candidateTerm: the term which the caller/candidate node thinks is most recent & which its election is in
+        :param candidateIndex: the index of that caller/candidate node
+        :return tuple(int, boolean): what term this node thinks is most recent and whether this node is voting for the
+        caller candidate node
+        '''
         willVote = False
 
         voteRequestStartTime = time.time()
@@ -341,7 +361,7 @@ class RaftNode(rpyc.Service):
                 self.currLeader = None
                 self.currTerm = candidateTerm
                 self._save_node_state()
-                self._restart_timeout()
+                self._restart_timer()
             else:
                 if self.exposed_is_leader():
                     self.nodeLogger.warning("elected leader %d received request_vote() from candidate %d "
@@ -358,7 +378,7 @@ class RaftNode(rpyc.Service):
 
             if not self.isCandidate and self.currLeader is None and self.voteTarget is None:
                 self.nodeLogger.critical("casting vote for candidate node %d in term %d", candidateIndex, self.currTerm)
-                self._restart_timeout()
+                self._restart_timer()
 
                 self.voteTarget = candidateIndex
                 self._save_node_state()
@@ -375,6 +395,11 @@ class RaftNode(rpyc.Service):
         return (self.currTerm, willVote)
 
     def call_request_vote(self, otherNodeDesc):
+        '''sends a vote request message to some other node by calling that RPC on that node
+        :param otherNodeDesc NodeRef: a description of the other node
+        :return tuple(int, boolean): what term the other node thinks is most recent and
+        whether the other node will vote for this one
+        '''
         assert self.isCandidate
         requestVoteRetVal = None
 
@@ -408,6 +433,7 @@ class RaftNode(rpyc.Service):
         return requestVoteRetVal
 
     def check_for_election_timeout(self):
+        '''checks whether the election timer has actually expired and if so starts an election in a new term'''
         self.nodeLogger.debug("about to acquire LOCK to check for election timeout")
         self.stateLock.acquire()
         self.nodeLogger.debug("successfully acquired LOCK to check for election timeout")
@@ -423,7 +449,7 @@ class RaftNode(rpyc.Service):
                 self.voteTarget = self.identityIndex
                 self.currTerm += 1
                 self._save_node_state()
-                self._restart_timeout()
+                self._restart_timer()
 
                 self.nodeLogger.critical("starting election for the new term %d", self.currTerm)
                 electionTerm = self.currTerm
@@ -490,7 +516,7 @@ class RaftNode(rpyc.Service):
                             self.currLeader = None
                             self.currTerm = responderTerm
                             self._save_node_state()
-                            self._restart_timeout()
+                            self._restart_timer()
 
                     # possible race condition with _leaderStatus?
                     if numVotes > numNodes / 2.0:
@@ -516,7 +542,8 @@ class RaftNode(rpyc.Service):
                 self.stateLock.release()
 
     def send_heartbeats(self):
-
+        '''as leader, send heartbeat/append_entries messages to all other nodes
+        so that they don't start elections in new terms'''
         self.stateLock.acquire()
 
         if not self.exposed_is_leader():
@@ -576,7 +603,7 @@ class RaftNode(rpyc.Service):
                                              self.currTerm, responderTerm)
                         self.currLeader = None
                         self.currTerm = responderTerm
-                        self._restart_timeout()
+                        self._restart_timer()
 
                 self.nodeLogger.debug("releasing the LOCK after sending heartbeat to node %s", currOtherNode.name)
                 self.stateLock.release()
