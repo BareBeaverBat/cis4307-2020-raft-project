@@ -4,8 +4,13 @@ import random
 import threading
 import time
 import traceback
+import math
 
 import rpyc
+from rpyc.utils import helpers
+from rpyc.core import AsyncResultTimeout
+import socket
+
 import sys
 
 
@@ -27,8 +32,9 @@ protocol.
 
 
 class RaftNode(rpyc.Service):
-    ELECTION_TIMEOUT_BASELINE = 0.150*15   # seconds to wait before calling an election
-    HEARTBEAT_INTERVAL = ELECTION_TIMEOUT_BASELINE * 0.75
+    ELECTION_TIMEOUT_BASELINE = 0.3   #used to calculate the seconds to wait before calling an election, based on communication delay for contacting 1 active node
+    CONNECTION_TIMEOUT = 0.35
+
     NODE_STATE_FOLDER = "node_states"
     NODE_LOGS_FOLDER = "node_logs"
 
@@ -191,8 +197,24 @@ class RaftNode(rpyc.Service):
                     otherNode = NodeRef(otherNodeName, otherNodeHost, otherNodePort)
                     self.otherNodes.append(otherNode)
 
-        self.electionTimeout = (1 + random.random()) * RaftNode.ELECTION_TIMEOUT_BASELINE
+        numOtherNodes = len(self.otherNodes)
+        numNodes = 1+ numOtherNodes
+
+
+        #subtracting 1 because this node already provides itself with 1 vote when it's a candidate
+        if numNodes % 2 == 0:
+            numVotesNeeded = numNodes/2 + 1 -1
+        else:
+            numVotesNeeded = math.ceil(numNodes/2) -1
+        # based on worst-case where only a bare majority of nodes are still alive & one or more of those live nodes
+        #  is after all of the dead ones in the list
+        minimumElectionTimeout = (numOtherNodes-numVotesNeeded)*RaftNode.CONNECTION_TIMEOUT + \
+                               RaftNode.ELECTION_TIMEOUT_BASELINE*numVotesNeeded
+        #todo try 0.5-1.5 rather than 1-2 or 0.75-1.75
+        self.electionTimeout = (1 + random.random())*minimumElectionTimeout
         self._restart_timeout()
+
+        self.heartbeatInterval = 0.5*minimumElectionTimeout
 
         self.nodeLogger.critical("I am node %d (election timeout %f) and I just finished being constructed, with %d fellow nodes",
                                  self.identityIndex, self.electionTimeout, len(self.otherNodes))
@@ -279,10 +301,17 @@ class RaftNode(rpyc.Service):
         heartbeatRpcStartTime = time.time()
 
         try:
-            nodeConn = rpyc.connect(otherNodeDesc.host, otherNodeDesc.port)
+            nodeConnStream = rpyc.SocketStream.connect(otherNodeDesc.host, otherNodeDesc.port,
+                                                       timeout= RaftNode.CONNECTION_TIMEOUT, attempts= 1)
+            nodeConn = rpyc.connect_stream(nodeConnStream)
             otherNodeRoot = nodeConn.root
-            appendEntriesRetVal = otherNodeRoot.append_entries(self.currTerm, self.identityIndex)
-        except ConnectionRefusedError:
+            timedAppendEntriesProxy = helpers.timed(otherNodeRoot.append_entries, RaftNode.CONNECTION_TIMEOUT)
+            appendEntriesPromise = timedAppendEntriesProxy(self.currTerm, self.identityIndex)
+            appendEntriesRetVal = appendEntriesPromise.value
+        except AsyncResultTimeout:
+            self.nodeLogger.info("connection timed out while leader node %d in term %d tried to send append_entries "
+                                 "to node %s", self.identityIndex, self.currTerm, otherNodeDesc.name)
+        except (socket.timeout, ConnectionRefusedError):
             self.nodeLogger.info("leader node %d in term %d was unable to connect to another node %s",
                                  self.identityIndex, self.currTerm, otherNodeDesc.name)
         except EOFError:
@@ -375,10 +404,17 @@ class RaftNode(rpyc.Service):
         voteRequestRpcStartTime = time.time()
 
         try:
-            nodeConn = rpyc.connect(otherNodeDesc.host, otherNodeDesc.port)
+            nodeConnStream = rpyc.SocketStream.connect(otherNodeDesc.host, otherNodeDesc.port,
+                                    timeout=RaftNode.CONNECTION_TIMEOUT, attempts=1)
+            nodeConn = rpyc.connect_stream(nodeConnStream)
             otherNodeRoot = nodeConn.root
-            requestVoteRetVal = otherNodeRoot.request_vote(self.currTerm, self.identityIndex)
-        except ConnectionRefusedError as cre:
+            timedRequestVoteProxy = helpers.timed(otherNodeRoot.request_vote, RaftNode.CONNECTION_TIMEOUT)
+            voteRequestPromise = timedRequestVoteProxy(self.currTerm, self.identityIndex)
+            requestVoteRetVal = voteRequestPromise.value
+        except AsyncResultTimeout:
+            self.nodeLogger.info("connection timed out while candidate node %d in term %d tried to send request_vote "
+                                 "to node %s", self.identityIndex, self.currTerm, otherNodeDesc.name)
+        except (socket.timeout, ConnectionRefusedError):
             self.nodeLogger.info("candidate node %d in term %d was unable to connect to another node %s",
                                  self.identityIndex, self.currTerm, otherNodeDesc.name)
         except EOFError:
@@ -512,7 +548,7 @@ class RaftNode(rpyc.Service):
                                     self.currTerm)
             self.stateLock.release()
         else:
-            heartbeatTimer = threading.Timer(RaftNode.HEARTBEAT_INTERVAL, self.send_heartbeats)
+            heartbeatTimer = threading.Timer(self.heartbeatInterval, self.send_heartbeats)
             heartbeatTimer.start()
 
             leaderTerm = self.currTerm
